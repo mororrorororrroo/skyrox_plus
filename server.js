@@ -13,6 +13,7 @@ const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PROXY_PREFIX = '/proxy/';
 const CONTEXT_COOKIE = '__proxy_origin';
+const YOUTUBE_TV_USER_AGENT = 'Mozilla/5.0 (Linux; Android 14; UHD Google TV STB Build/UTT1.250214.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/151.0.7922.199 Mobile Safari/537.36';
 const MAX_SOCKETS = positiveInteger(process.env.MAX_SOCKETS, 16);
 const MAX_FREE_SOCKETS = positiveInteger(process.env.MAX_FREE_SOCKETS, 16);
 const MAX_TOTAL_SOCKETS = positiveInteger(process.env.MAX_TOTAL_SOCKETS, 64);
@@ -56,9 +57,47 @@ function sanitizeLocationValue(value) {
     .replace(/[^\x21-\x7e]/gu, (character) => encodeURIComponent(character));
 }
 
+function keepYouTubeTvRedirectInsideProxy(data) {
+  if (!data?.headers || data.headers.location == null || !data.url) return;
+  let source;
+  try { source = new URL(data.url); } catch { return; }
+  const sourceHost = source.hostname.toLowerCase();
+  if (sourceHost !== 'youtube.com' && sourceHost !== 'www.youtube.com') return;
+  const rewrite = (value) => {
+    if (typeof value !== 'string') return value;
+    try {
+      const target = new URL(value, source);
+      const host = target.hostname.toLowerCase();
+      if ((host === 'youtube.com' || host === 'www.youtube.com') &&
+          (target.pathname === '/tv' || target.pathname.startsWith('/tv/'))) {
+        return `${PROXY_PREFIX}${target.href}`;
+      }
+    } catch {}
+    return value;
+  };
+  data.headers.location = Array.isArray(data.headers.location)
+    ? data.headers.location.map(rewrite)
+    : rewrite(data.headers.location);
+}
+
 function sanitizeProxyResponseHeaders(data) {
   if (!data?.headers || data.headers.location == null) return;
   data.headers.location = sanitizeLocationValue(data.headers.location);
+}
+
+// Normalize malformed proxied Location values such as /proxy/https:/host/path.
+function repairMalformedProxyLocation(data) {
+  if (!data?.headers || data.headers.location == null) return;
+  const repair = (location) => {
+    if (typeof location !== 'string') return location;
+    return location.replace(
+      /\/proxy\/(https?):\/(?!\/)/gi,
+      '/proxy/$1://'
+    );
+  };
+  data.headers.location = Array.isArray(data.headers.location)
+    ? data.headers.location.map(repair)
+    : repair(data.headers.location);
 }
 
 // Fix minecraft-mcworld.com download redirects whose Japanese filename was
@@ -66,17 +105,49 @@ function sanitizeProxyResponseHeaders(data) {
 function repairMinecraftDownloadRedirect(data) {
   if (!data?.headers || data.headers.location == null || !data.url) return;
   const repair = (location) => {
-    if (typeof location !== 'string') return location;
-    try {
-      const absolute = new URL(location, data.url);
-      return repairMinecraftDownloadUrl(absolute.href);
-    } catch {
-      return location;
+    const repaired = repairMinecraftDownloadLocation(location, data.url);
+    if (repaired !== location) {
+      console.log(JSON.stringify({
+        type: 'minecraft-download-redirect-repaired',
+        sourceUrl: data.url,
+        before: location,
+        after: repaired
+      }));
     }
+    return repaired;
   };
   data.headers.location = Array.isArray(data.headers.location)
     ? data.headers.location.map(repair)
     : repair(data.headers.location);
+}
+function repairMinecraftDownloadLocation(location, baseUrl) {
+  if (typeof location !== 'string') return location;
+  let absolute;
+  try {
+    absolute = new URL(location, baseUrl);
+  } catch {
+    return location;
+  }
+
+  // Unblocker may already have wrapped the upstream Location in this proxy's
+  // URL. Repair the inner minecraft-mcworld.com URL without confusing the
+  // proxy host with the upstream host.
+  const proxyIndex = absolute.pathname.indexOf(PROXY_PREFIX);
+  if (proxyIndex !== -1) {
+    let innerTarget =
+      absolute.pathname.slice(proxyIndex + PROXY_PREFIX.length) +
+      absolute.search +
+      absolute.hash;
+    innerTarget = innerTarget.replace(/^(https?):\/(?!\/)/i, '$1://');
+    innerTarget = innerTarget.replace(/%25([0-9a-f]{2})/gi, '%$1');
+    const repairedInnerTarget = repairMinecraftDownloadUrl(innerTarget);
+    if (repairedInnerTarget !== innerTarget) {
+      const proxyPath = absolute.pathname.slice(0, proxyIndex + PROXY_PREFIX.length);
+      return `${absolute.origin}${proxyPath}${repairedInnerTarget}`;
+    }
+  }
+
+  return repairMinecraftDownloadUrl(absolute.href);
 }
 
 function repairMinecraftDownloadUrl(value) {
@@ -220,6 +291,25 @@ function cleanProxyRequest(data) {
   if (!data?.headers) return;
   delete data.headers['proxy-connection'];
 }
+function applyYouTubeTvUserAgent(data) {
+  if (!data?.headers || !data.url) return;
+  let target;
+  try {
+    target = new URL(data.url);
+  } catch {
+    return;
+  }
+  const hostname = target.hostname.toLowerCase();
+  const isYouTubeHost = hostname === 'youtube.com' || hostname === 'www.youtube.com';
+  if (!isYouTubeHost) return;
+  const referer = String(data.headers.referer || '');
+  const isTvRequest = target.pathname === '/tv' || target.pathname.startsWith('/tv/');
+  const isTvSubrequest = /^https?:\/\/(?:www\.)?youtube\.com\/tv(?:[/?#]|$)/i.test(referer);
+  if (!isTvRequest && !isTvSubrequest) return;
+  data.headers['user-agent'] = YOUTUBE_TV_USER_AGENT;
+  data.headers.origin = 'https://www.youtube.com';
+  if (data.headers.referer) data.headers.referer = 'https://www.youtube.com/tv';
+}
 
 function addConservativeAssetCache(data) {
   if (!data?.headers || !data.clientRequest || !data.remoteResponse) return;
@@ -296,13 +386,39 @@ function decodePathFilename(pathname) {
   }
 }
 
+// Fallback for hosting environments where /dl/ reaches Express. Cloud Shell may
+// reserve /dl/, so the browser-side patch below remains the primary fix there.
+app.use((req, res, next) => {
+  if (req.path !== '/dl' && req.path !== '/dl/') return next();
+  const refererOrigin = getOriginFromProxyReferer(req);
+  if (refererOrigin !== 'https://minecraft-mcworld.com' &&
+      refererOrigin !== 'https://www.minecraft-mcworld.com') return next();
+  let target;
+  try {
+    target = new URL(req.originalUrl, `${refererOrigin}/`);
+  } catch {
+    return next();
+  }
+  req.url = `${PROXY_PREFIX}${target.href}`;
+  console.log(JSON.stringify({
+    type: 'minecraft-download-navigation',
+    originalUrl: req.originalUrl,
+    target: target.href
+  }));
+  next();
+});
+
 app.use((req, res, next) => {
   if (req.originalUrl.startsWith(PROXY_PREFIX)) return next();
   if (req.path === '/') return next();
   if (isLocalRoute(req.path)) return next();
   const proxyRefererOrigin = getOriginFromProxyReferer(req);
   const contextCookieOrigin = getOriginFromContextCookie(req);
-  const upstreamOrigin = proxyRefererOrigin || contextCookieOrigin;
+  // If a Referer exists but cannot be parsed as a proxied page, do not reuse a
+  // stale origin cookie from another site.
+  const upstreamOrigin = req.get('referer')
+    ? proxyRefererOrigin
+    : contextCookieOrigin;
   const destination = String(req.get('sec-fetch-dest') || '').toLowerCase();
   const mode = String(req.get('sec-fetch-mode') || '').toLowerCase();
   const isNavigation =
@@ -321,6 +437,91 @@ app.use((req, res, next) => {
   req.url = `${PROXY_PREFIX}${target.href}`;
   next();
 });
+
+// Relay YouTube TV account APIs directly. Unblocker normalizes a target like
+// https://www.youtube.com/... into a 307 Location containing https:/..., which
+// breaks POST-based device OAuth and account discovery in a redirect loop.
+app.use(PROXY_PREFIX, relayYouTubeTvAccountApi);
+function relayYouTubeTvAccountApi(req, res, next) {
+  if (!['GET', 'POST', 'OPTIONS'].includes(req.method)) return next();
+  let rawTarget = req.originalUrl.slice(PROXY_PREFIX.length);
+  rawTarget = rawTarget.replace(/^(https?):\/(?!\/)/i, '$1://');
+  let target;
+  try { target = new URL(rawTarget); } catch { return next(); }
+  const host = target.hostname.toLowerCase();
+  if (target.protocol !== 'https:' || (host !== 'youtube.com' && host !== 'www.youtube.com')) return next();
+  const allowed = target.pathname === '/o/oauth2/token' ||
+    target.pathname.startsWith('/youtubei/v1/account/') ||
+    target.pathname.startsWith('/api/lounge/');
+  if (!allowed) return next();
+  if (req.method === 'OPTIONS') {
+    setYouTubeTvCors(req, res);
+    return res.status(204).end();
+  }
+  const headers = Object.create(null);
+  const forwarded = [
+    'accept', 'accept-encoding', 'accept-language', 'authorization',
+    'content-type', 'cookie', 'x-goog-request-time', 'x-goog-visitor-id',
+    'x-youtube-client-name', 'x-youtube-client-version',
+    'x-youtube-lava-device-context', 'x-youtube-page-cl', 'x-youtube-page-label'
+  ];
+  for (const name of forwarded) if (req.headers[name] != null) headers[name] = req.headers[name];
+  headers.host = target.host;
+  headers['user-agent'] = YOUTUBE_TV_USER_AGENT;
+  headers.origin = 'https://www.youtube.com';
+  headers.referer = 'https://www.youtube.com/tv';
+  if (req.headers['content-length'] != null) headers['content-length'] = req.headers['content-length'];
+  const upstream = https.request(target, {
+    method: req.method,
+    headers,
+    agent: httpsAgent,
+    timeout: 30_000
+  }, (remote) => {
+    const responseHeaders = { ...remote.headers };
+    for (const name of ['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']) {
+      delete responseHeaders[name];
+    }
+    // The browser talks to this proxy origin, so expose the API response there.
+    const origin = req.get('origin');
+    if (origin) {
+      responseHeaders['access-control-allow-origin'] = origin;
+      responseHeaders['access-control-allow-credentials'] = 'true';
+      responseHeaders.vary = appendVary(responseHeaders.vary, 'Origin');
+    }
+    if (responseHeaders.location) {
+      try {
+        const redirected = new URL(responseHeaders.location, target);
+        if (redirected.protocol === 'https:' &&
+            (redirected.hostname === 'youtube.com' || redirected.hostname === 'www.youtube.com')) {
+          responseHeaders.location = `${PROXY_PREFIX}${redirected.href}`;
+        }
+      } catch {}
+    }
+    res.writeHead(Number(remote.statusCode || 502), responseHeaders);
+    remote.pipe(res);
+  });
+  upstream.once('timeout', () => upstream.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
+  upstream.once('error', (error) => {
+    console.error(JSON.stringify({ type: 'youtube-tv-account-api-error', code: error.code || 'ERROR', path: target.pathname }));
+    if (!res.headersSent) res.status(502).send('Bad Gateway');
+    else res.destroy(error);
+  });
+  req.once('aborted', () => upstream.destroy());
+  req.pipe(upstream);
+}
+function setYouTubeTvCors(req, res) {
+  const origin = req.get('origin');
+  if (origin) res.set('Access-Control-Allow-Origin', origin);
+  res.set('Access-Control-Allow-Credentials', 'true');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers', req.get('access-control-request-headers') || 'content-type,authorization');
+  res.set('Vary', 'Origin, Access-Control-Request-Headers');
+}
+function appendVary(current, value) {
+  const values = String(current || '').split(',').map((item) => item.trim()).filter(Boolean);
+  if (!values.some((item) => item.toLowerCase() === value.toLowerCase())) values.push(value);
+  return values.join(', ');
+}
 
 // MCPEDL loads many Nuxt chunks simultaneously. Relay only its static assets
 // directly and retry one safe GET/HEAD once on transient upstream failures.
@@ -385,9 +586,11 @@ const unblocker = new Unblocker({
   clientScripts: true,
   httpAgent,
   httpsAgent,
-  requestMiddleware: [cleanProxyRequest],
+  requestMiddleware: [cleanProxyRequest, applyYouTubeTvUserAgent],
   responseMiddleware: [
+    repairMalformedProxyLocation,
     repairMinecraftDownloadRedirect,
+    keepYouTubeTvRedirectInsideProxy,
     sanitizeProxyResponseHeaders,
     rememberDocumentOrigin,
     preserveDownloadResponse,
@@ -401,19 +604,264 @@ const unblockerClientPath = findUnblockerClientScript();
 let unblockerClientSource = null;
 if (unblockerClientPath) {
   try {
-    unblockerClientSource = fs.readFileSync(unblockerClientPath, 'utf8');
+    unblockerClientSource = patchUnblockerClientForUrlObjects(
+      fs.readFileSync(unblockerClientPath, 'utf8')
+    );
   } catch (error) {
     console.error('Unable to load unblocker client script:', error.message);
   }
 }
 
-app.get(`${PROXY_PREFIX}client/unblocker-client.js`, (req, res, next) => {
+// YouTube TV uses Trusted Types and may assign TrustedScriptURL objects to
+// script.src. Older unblocker clients assume src is always a string and crash
+// in fixUrl() when they call urlStr.substr(...). Coerce the value at the start
+// of fixUrl so both strings and URL-like Trusted Types values are supported.
+function patchUnblockerClientForUrlObjects(source) {
+  let patched = String(source || '');
+
+  // note uses Next.js/webpack and can pass URL, TrustedScriptURL, TrustedURL,
+  // or other string-like values to script/link setters. Older unblocker builds
+  // call string-only methods directly, which aborts hydration on note.
+  const declarations = [
+    /(function\s+fixUrl\s*\(\s*urlStr\b[^)]*\)\s*\{)/,
+    /(fixUrl\s*=\s*function\s*\(\s*urlStr\b[^)]*\)\s*\{)/,
+    /((?:const|let|var)\s+fixUrl\s*=\s*\(\s*urlStr\b[^)]*\)\s*=>\s*\{)/
+  ];
+
+  for (const declaration of declarations) {
+    if (declaration.test(patched)) {
+      patched = patched.replace(declaration, '$1\n    urlStr = String(urlStr);');
+      break;
+    }
+  }
+
+  // Cover minified/transformed variants and other string-only operations.
+  patched = patched
+    .replace(/urlStr\.substr\(/g, 'String(urlStr).substr(')
+    .replace(/urlStr\.substring\(/g, 'String(urlStr).substring(')
+    .replace(/urlStr\.startsWith\(/g, 'String(urlStr).startsWith(')
+    .replace(/urlStr\.indexOf\(/g, 'String(urlStr).indexOf(');
+
+  return patched;
+}
+
+function sendPatchedUnblockerClient(req, res, next) {
   if (!unblockerClientSource) return next();
   res.set('Content-Type', 'application/javascript; charset=utf-8');
-  res.set('Cache-Control', 'no-cache');
+  // Do not let a previously cached, unpatched helper keep breaking note.
+  res.set('Cache-Control', 'no-store, max-age=0');
+  res.set('Pragma', 'no-cache');
   res.set('X-Content-Type-Options', 'nosniff');
-  res.send(`${unblockerClientSource}\n${MCPEDL_CLIENT_RECOVERY}`);
-});
+  res.send(`${unblockerClientSource}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}`);
+}
+
+// Different unblocker releases emit either path. Register both before
+// app.use(unblocker), so note always receives the patched browser helper.
+app.get(`${PROXY_PREFIX}client/unblocker-client.js`, sendPatchedUnblockerClient);
+app.get(`${PROXY_PREFIX}unblocker-client.js`, sendPatchedUnblockerClient);
+
+// Keep top-level link navigation inside the proxy. Unblocker's URL wrappers
+// cover many DOM assignments, but sites such as DuckDuckGo can install a
+// direct absolute result URL after rendering. Capture navigation gestures and
+// normalize those links before the browser leaves this origin.
+const GLOBAL_PROXIED_NAVIGATION_PATCH = String.raw`;(function () {
+  'use strict';
+  var PREFIX = '/proxy/';
+
+  function upstreamPageUrl() {
+    var path = String(window.location.pathname || '');
+    if (path.indexOf(PREFIX) !== 0) return null;
+    var raw = path.slice(PREFIX.length) + String(window.location.search || '') + String(window.location.hash || '');
+    raw = raw.replace(/^(https?):\/(?!\/)/i, '$1://');
+    try {
+      var url = new URL(raw);
+      return /^https?:$/.test(url.protocol) ? url : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function unwrapDuckDuckGoRedirect(url) {
+    var host = String(url.hostname || '').toLowerCase();
+    if (host !== 'duckduckgo.com' && host !== 'www.duckduckgo.com' && host !== 'links.duckduckgo.com') return url;
+    var encoded = url.searchParams.get('uddg');
+    if (!encoded) return url;
+    try {
+      var destination = new URL(encoded);
+      if (/^https?:$/.test(destination.protocol)) return destination;
+    } catch (error) {}
+    return url;
+  }
+
+  function proxiedHref(anchor) {
+    if (!anchor || !anchor.getAttribute) return null;
+    var raw = anchor.getAttribute('href');
+    if (!raw || raw.charAt(0) === '#' || /^(?:javascript|mailto|tel|data|blob):/i.test(raw)) return null;
+    if (raw.indexOf(PREFIX) === 0) return null;
+
+    var upstream = upstreamPageUrl();
+    if (!upstream) return null;
+
+    var target;
+    try {
+      target = new URL(raw, upstream);
+    } catch (error) {
+      return null;
+    }
+    if (!/^https?:$/.test(target.protocol)) return null;
+    target = unwrapDuckDuckGoRedirect(target);
+    return PREFIX + target.href;
+  }
+
+  function rewriteAnchor(event) {
+    var node = event.target;
+    var anchor = node && node.closest ? node.closest('a[href]') : null;
+    if (!anchor) return;
+    var fixed = proxiedHref(anchor);
+    if (fixed) anchor.setAttribute('href', fixed);
+  }
+
+  // pointerdown/mousedown makes middle-click, Ctrl/Cmd-click and context-menu
+  // "open in new tab" see the rewritten href before the browser navigates.
+  document.addEventListener('pointerdown', rewriteAnchor, true);
+  document.addEventListener('mousedown', rewriteAnchor, true);
+  document.addEventListener('contextmenu', rewriteAnchor, true);
+  document.addEventListener('click', rewriteAnchor, true);
+  document.addEventListener('auxclick', rewriteAnchor, true);
+})();`;
+// Cloud Shell reserves the top-level /dl/ path. Crafters Colony's original
+// download_bt_func navigates there, so intercept the gesture before the site's
+// inline onclick handler and navigate directly to the proxied upstream /dl/.
+const MINECRAFT_DOWNLOAD_NAVIGATION_PATCH = String.raw`;(function () {
+  'use strict';
+  var PREFIX = '/proxy/';
+
+  function upstreamPageUrl() {
+    var path = String(window.location.pathname || '');
+    if (path.indexOf(PREFIX) !== 0) return null;
+    var raw = path.slice(PREFIX.length) + String(window.location.search || '');
+    raw = raw.replace(/^(https?):\/(?!\/)/i, '$1://');
+    try {
+      var url = new URL(raw);
+      return /^https?:$/.test(url.protocol) ? url : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function isMinecraftPage() {
+    var upstream = upstreamPageUrl();
+    if (!upstream) return false;
+    var host = String(upstream.hostname || '').toLowerCase();
+    return host === 'minecraft-mcworld.com' || host === 'www.minecraft-mcworld.com';
+  }
+
+  function downloadUrl(postid, type) {
+    var target = new URL('https://minecraft-mcworld.com/dl/');
+    target.searchParams.set('postid', String(postid));
+    target.searchParams.set('type', String(type == null ? 0 : type));
+    return PREFIX + target.href;
+  }
+
+  function parseInvocation(node) {
+    var clickable = node && node.closest
+      ? node.closest('[onclick*="download_bt_func"]')
+      : null;
+    if (!clickable) return null;
+    var source = String(clickable.getAttribute('onclick') || '');
+    var match = source.match(/download_bt_func\s*\(\s*['"]?(\d+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/);
+    return match ? { postid: match[1], type: match[2] } : null;
+  }
+
+  // Capture phase runs before the page's inline onclick handler.
+  document.addEventListener('click', function (event) {
+    if (!isMinecraftPage()) return;
+    var invocation = parseInvocation(event.target);
+    if (!invocation) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    var destination = downloadUrl(invocation.postid, invocation.type);
+    console.info('[proxy] Minecraft download navigation:', destination);
+    window.location.assign(destination);
+  }, true);
+
+  // Also replace the global function for keyboard/programmatic invocations.
+  var attempts = 0;
+  function installFunctionPatch() {
+    attempts += 1;
+    if (!isMinecraftPage()) return;
+    var original = window.download_bt_func;
+    if (typeof original === 'function' && !original.__proxyDownloadPatched) {
+      function patched(postid, type) {
+        window.location.assign(downloadUrl(postid, type));
+      }
+      patched.__proxyDownloadPatched = true;
+      patched.__proxyOriginal = original;
+      window.download_bt_func = patched;
+      return;
+    }
+    if (attempts < 300) window.setTimeout(installFunctionPatch, 100);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installFunctionPatch, { once: true });
+  } else {
+    installFunctionPatch();
+  }
+})();`;
+
+// YouTube TV inserts <yt-debug-watermark> when the current host is not an
+// approved debug-access domain. This UI-only patch removes that warning node
+// and watches for later re-insertion by client-side rendering.
+const YOUTUBE_TV_WATERMARK_PATCH = String.raw`;(function () {
+  'use strict';
+  // Keep the post-login /tv return URL on the proxy origin. YouTube may use an
+  // absolute top-level navigation which cannot be fixed by response headers.
+  function proxyYouTubeTvUrl(value) {
+    try {
+      var url = new URL(String(value), 'https://www.youtube.com');
+      if ((url.hostname === 'youtube.com' || url.hostname === 'www.youtube.com') &&
+          (url.pathname === '/tv' || url.pathname.indexOf('/tv/') === 0)) {
+        return '/proxy/' + url.href;
+      }
+    } catch (error) {}
+    return value;
+  }
+  document.addEventListener('click', function (event) {
+    var element = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+    if (!element) return;
+    var fixed = proxyYouTubeTvUrl(element.getAttribute('href'));
+    if (fixed !== element.getAttribute('href')) element.setAttribute('href', fixed);
+  }, true);
+  function isYouTubeTvPage() {
+    var path = String(window.location.pathname || '').toLowerCase();
+    return path.indexOf('/proxy/https://www.youtube.com/tv') === 0 ||
+      path.indexOf('/proxy/https://youtube.com/tv') === 0;
+  }
+  if (!isYouTubeTvPage()) return;
+  function removeDebugWatermarks(root) {
+    if (!root) return;
+    if (root.nodeType === 1 && root.matches && root.matches('yt-debug-watermark')) {
+      root.remove();
+      return;
+    }
+    if (!root.querySelectorAll) return;
+    var nodes = root.querySelectorAll('yt-debug-watermark');
+    for (var i = 0; i < nodes.length; i += 1) nodes[i].remove();
+  }
+  function start() {
+    removeDebugWatermarks(document);
+    var observer = new MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i += 1) {
+        var added = records[i].addedNodes;
+        for (var j = 0; j < added.length; j += 1) removeDebugWatermarks(added[j]);
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+  if (document.documentElement) start();
+  else document.addEventListener('DOMContentLoaded', start, { once: true });
+})();`;
 
 // MCPEDL marks the home-page Nuxt fetch as client-only. When its cached SSR
 // response contains frontpageV2=null, hydration can leave all shelves empty.
