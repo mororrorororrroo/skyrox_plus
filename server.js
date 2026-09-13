@@ -17,9 +17,11 @@ const POKI_WEB_ORIGIN = 'https://poki.com';
 const POKI_ROUTE_PREFIX = '/jp';
 const POKI_AUTH_HOSTS = new Set(['poki-auth.poki.com']);
 const YOUTUBE_TV_USER_AGENT = 'Mozilla/5.0 (Linux; Android 14; UHD Google TV STB Build/UTT1.250214.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/151.0.7922.199 Mobile Safari/537.36';
-const MAX_SOCKETS = positiveInteger(process.env.MAX_SOCKETS, 16);
-const MAX_FREE_SOCKETS = positiveInteger(process.env.MAX_FREE_SOCKETS, 16);
-const MAX_TOTAL_SOCKETS = positiveInteger(process.env.MAX_TOTAL_SOCKETS, 64);
+const MAX_SOCKETS = positiveInteger(process.env.MAX_SOCKETS, 64);
+const MAX_FREE_SOCKETS = positiveInteger(process.env.MAX_FREE_SOCKETS, 32);
+const MAX_TOTAL_SOCKETS = positiveInteger(process.env.MAX_TOTAL_SOCKETS, 128);
+const ASSET_CACHE_SECONDS = positiveInteger(process.env.ASSET_CACHE_SECONDS, 1800);
+const CLIENT_HELPER_CACHE_SECONDS = positiveInteger(process.env.CLIENT_HELPER_CACHE_SECONDS, 300);
 const MINECRAFT_DOWNLOAD_HOSTS = new Set([
   'minecraft-mcworld.com',
   'www.minecraft-mcworld.com'
@@ -28,7 +30,7 @@ const MINECRAFT_DOWNLOAD_EXTENSIONS = new Set(['.mcworld', '.mcpack', '.zip']);
 
 const agentOptions = {
   keepAlive: true,
-  keepAliveMsecs: 10_000,
+  keepAliveMsecs: 30_000,
   maxSockets: MAX_SOCKETS,
   maxFreeSockets: MAX_FREE_SOCKETS,
   maxTotalSockets: MAX_TOTAL_SOCKETS,
@@ -287,7 +289,7 @@ app.use(express.static(PUBLIC_DIR, {
   index: false,
   etag: true,
   lastModified: true,
-  maxAge: '1h',
+  maxAge: '1d',
   setHeaders(res, filePath) {
     if (filePath.endsWith('.html')) {
       res.setHeader('Cache-Control', 'no-cache');
@@ -481,7 +483,10 @@ function addConservativeAssetCache(data) {
     contentType.includes('text/css') ||
     contentType.includes('javascript') ||
     contentType.includes('application/wasm');
-  if (staticAsset) data.headers['cache-control'] = 'private, max-age=300';
+  if (staticAsset) {
+    data.headers['cache-control'] =
+      `private, max-age=${ASSET_CACHE_SECONDS}, stale-while-revalidate=60`;
+  }
 }
 
 function preserveDownloadResponse(data) {
@@ -1002,9 +1007,10 @@ function patchUnblockerClientForUrlObjects(source) {
 function sendPatchedUnblockerClient(req, res, next) {
   if (!unblockerClientSource) return next();
   res.set('Content-Type', 'application/javascript; charset=utf-8');
-  // Do not let a previously cached, unpatched helper keep breaking note.
-  res.set('Cache-Control', 'no-store, max-age=0');
-  res.set('Pragma', 'no-cache');
+  // This helper is identical for every page in the current deployment. A short
+  // browser cache avoids downloading and parsing it again on every navigation,
+  // while still allowing fixes to propagate quickly after a deployment.
+  res.set('Cache-Control', `private, max-age=${CLIENT_HELPER_CACHE_SECONDS}, must-revalidate`);
   res.set('X-Content-Type-Options', 'nosniff');
   res.send(`${unblockerClientSource}\n${BLOXD_RELATIVE_RESOURCE_PATCH}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}\n${POKI_CLEAN_NAVIGATION_PATCH}`);
 }
@@ -1416,7 +1422,7 @@ const server = app.listen(PORT, () => {
   console.log(`Proxy listening on ${PORT}`);
 });
 
-server.keepAliveTimeout = 15_000;
+server.keepAliveTimeout = 30_000;
 server.headersTimeout = 20_000;
 server.requestTimeout = 120_000;
 server.setTimeout(120_000);
