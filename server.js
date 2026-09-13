@@ -14,6 +14,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const PROXY_PREFIX = '/proxy/';
 const CONTEXT_COOKIE = '__proxy_origin';
 const POKI_WEB_ORIGIN = 'https://poki.com';
+const POKI_ROUTE_PREFIX = '/jp';
 const POKI_AUTH_HOSTS = new Set(['poki-auth.poki.com']);
 const YOUTUBE_TV_USER_AGENT = 'Mozilla/5.0 (Linux; Android 14; UHD Google TV STB Build/UTT1.250214.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/151.0.7922.199 Mobile Safari/537.36';
 const MAX_SOCKETS = positiveInteger(process.env.MAX_SOCKETS, 16);
@@ -88,6 +89,29 @@ function keepYouTubeTvRedirectInsideProxy(data) {
       if ((host === 'youtube.com' || host === 'www.youtube.com') &&
           (target.pathname === '/tv' || target.pathname.startsWith('/tv/'))) {
         return `${PROXY_PREFIX}${target.href}`;
+      }
+    } catch {}
+    return value;
+  };
+  data.headers.location = Array.isArray(data.headers.location)
+    ? data.headers.location.map(rewrite)
+    : rewrite(data.headers.location);
+}
+
+function keepPokiRedirectOnCleanRoute(data) {
+  if (!data?.headers || data.headers.location == null || !data.url) return;
+  let source;
+  try { source = new URL(data.url); } catch { return; }
+  const host = source.hostname.toLowerCase();
+  if (host !== 'poki.com' && host !== 'www.poki.com') return;
+  const rewrite = (value) => {
+    if (typeof value !== 'string') return value;
+    try {
+      const target = new URL(value, source);
+      const targetHost = target.hostname.toLowerCase();
+      if ((targetHost === 'poki.com' || targetHost === 'www.poki.com') &&
+          (target.pathname === POKI_ROUTE_PREFIX || target.pathname.startsWith(`${POKI_ROUTE_PREFIX}/`))) {
+        return `${target.pathname}${target.search}${target.hash}`;
       }
     } catch {}
     return value;
@@ -231,6 +255,33 @@ app.use(compression({
     return compression.filter(req, res);
   }
 }));
+
+// Expose Poki on a clean local pathname. Poki's React router reads
+// window.location.pathname, so /proxy/https://poki.com/jp/... is interpreted
+// as an unknown Poki route after hydration. Internally rewriting /jp/... keeps
+// the browser-visible pathname compatible with Poki while still using Unblocker.
+app.use((req, res, next) => {
+  if (!isCleanPokiRequest(req)) return next();
+  const target = new URL(req.originalUrl, `${POKI_WEB_ORIGIN}/`);
+  req.url = `${PROXY_PREFIX}${target.href}`;
+  next();
+});
+
+function isCleanPokiRequest(req) {
+  if (req.path === POKI_ROUTE_PREFIX || req.path.startsWith(`${POKI_ROUTE_PREFIX}/`)) {
+    return true;
+  }
+  const referer = req.get('referer');
+  const requestHost = req.get('host');
+  if (!referer || !requestHost || isLocalRoute(req.path)) return false;
+  try {
+    const ref = new URL(referer);
+    return ref.host === requestHost &&
+      (ref.pathname === POKI_ROUTE_PREFIX || ref.pathname.startsWith(`${POKI_ROUTE_PREFIX}/`));
+  } catch {
+    return false;
+  }
+}
 
 app.use(express.static(PUBLIC_DIR, {
   index: false,
@@ -889,6 +940,7 @@ const unblocker = new Unblocker({
   requestMiddleware: [cleanProxyRequest, applyPokiRequestContext, applyYouTubeTvUserAgent],
   responseMiddleware: [
     repairMalformedProxyLocation,
+    keepPokiRedirectOnCleanRoute,
     normalizePokiAuthResponse,
     sanitizePermissionsPolicy,
     repairMinecraftDownloadRedirect,
@@ -954,7 +1006,7 @@ function sendPatchedUnblockerClient(req, res, next) {
   res.set('Cache-Control', 'no-store, max-age=0');
   res.set('Pragma', 'no-cache');
   res.set('X-Content-Type-Options', 'nosniff');
-  res.send(`${unblockerClientSource}\n${BLOXD_RELATIVE_RESOURCE_PATCH}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}\n${POKI_SPA_ROUTE_PATCH}`);
+  res.send(`${unblockerClientSource}\n${BLOXD_RELATIVE_RESOURCE_PATCH}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}\n${POKI_CLEAN_NAVIGATION_PATCH}`);
 }
 
 // Different unblocker releases emit either path. Register both before
@@ -966,6 +1018,56 @@ app.get(`${PROXY_PREFIX}unblocker-client.js`, sendPatchedUnblockerClient);
 // cover many DOM assignments, but sites such as DuckDuckGo can install a
 // direct absolute result URL after rendering. Capture navigation gestures and
 // normalize those links before the browser leaves this origin.
+const POKI_CLEAN_NAVIGATION_PATCH = String.raw`;(function () {
+  'use strict';
+  var PREFIX = '/proxy/';
+  function cleanPokiUrl(value) {
+    if (!value) return null;
+    var raw = String(value);
+    if (raw.indexOf(PREFIX) === 0) raw = raw.slice(PREFIX.length);
+    try {
+      var url = new URL(raw, 'https://poki.com');
+      var host = String(url.hostname || '').toLowerCase();
+      if ((host === 'poki.com' || host === 'www.poki.com') &&
+          (url.pathname === '/jp' || url.pathname.indexOf('/jp/') === 0)) {
+        return url.pathname + url.search + url.hash;
+      }
+    } catch (error) {}
+    return null;
+  }
+  function rewrite(root) {
+    if (!root) return;
+    var nodes = [];
+    if (root.nodeType === 1 && root.matches && root.matches('a[href]')) nodes.push(root);
+    if (root.querySelectorAll) nodes = nodes.concat(Array.prototype.slice.call(root.querySelectorAll('a[href]')));
+    for (var i = 0; i < nodes.length; i += 1) {
+      var clean = cleanPokiUrl(nodes[i].getAttribute('href'));
+      if (clean) nodes[i].setAttribute('href', clean);
+    }
+  }
+  function start() {
+    rewrite(document.documentElement);
+    new MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i += 1) {
+        if (records[i].type === 'attributes') rewrite(records[i].target);
+        for (var j = 0; j < records[i].addedNodes.length; j += 1) rewrite(records[i].addedNodes[j]);
+      }
+    }).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['href'] });
+  }
+  document.addEventListener('click', function (event) {
+    var anchor = event.target && event.target.closest ? event.target.closest('a[href], [data-tile-url]') : null;
+    if (!anchor) return;
+    var clean = cleanPokiUrl(anchor.getAttribute('href') || anchor.getAttribute('data-tile-url'));
+    if (!clean) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    window.location.assign(clean);
+  }, true);
+  if (document.documentElement) start();
+  else document.addEventListener('DOMContentLoaded', start, { once: true });
+})();`;
+
 const BLOXD_RELATIVE_RESOURCE_PATCH = String.raw`;(function () {
   'use strict';
   var PREFIX = '/proxy/';
@@ -1212,90 +1314,6 @@ const YOUTUBE_TV_WATERMARK_PATCH = String.raw`;(function () {
 // response contains frontpageV2=null, hydration can leave all shelves empty.
 // Retry the site's own Vuex action after Nuxt is ready. The existing XHR/fetch
 // wrappers proxy the api.mcpedl.com request through this server.
-// Poki's client router reads the proxy-visible pathname after hydration.
-// It initially renders the upstream /jp page from server state, then interprets
-// /proxy/https://poki.com/jp as a Poki route and replaces the page with its 404.
-// Preserve the successfully rendered home view and restore it if that specific
-// false 404 is mounted. Links remain normal anchors and are handled by the
-// existing proxy navigation patch.
-const POKI_SPA_ROUTE_PATCH = String.raw`;(function () {
-  'use strict';
-  var PREFIX = '/proxy/';
-  var path = String(window.location.pathname || '');
-  var lower = path.toLowerCase();
-  if (lower.indexOf(PREFIX + 'https://poki.com/') !== 0 &&
-      lower.indexOf(PREFIX + 'https://www.poki.com/') !== 0) return;
-
-  // The language redirect adds a tracking fragment. It is not part of the
-  // upstream route and can trigger an unnecessary POP navigation.
-  if (/^#utm_/i.test(String(window.location.hash || ''))) {
-    try {
-      history.replaceState(history.state, document.title,
-        window.location.pathname + window.location.search);
-    } catch (error) {}
-  }
-
-  var savedMarkup = '';
-  var restoring = false;
-  var settled = false;
-
-  function isRealHome(root) {
-    return !!root && !root.querySelector('#pageError') &&
-      !!(root.querySelector('[id^="pageHome"]') ||
-         root.querySelector('.summaryTile') ||
-         root.querySelector('a[href*="/g/"]'));
-  }
-
-  function capture(root) {
-    if (!savedMarkup && isRealHome(root)) {
-      savedMarkup = root.innerHTML;
-      console.info('[proxy] captured Poki page before client-route hydration');
-    }
-  }
-
-  function repair() {
-    if (restoring || settled) return;
-    var root = document.getElementById('app-root');
-    if (!root) return;
-    capture(root);
-    if (!root.querySelector('#pageError') || !savedMarkup) return;
-
-    restoring = true;
-    root.innerHTML = savedMarkup;
-    settled = true;
-    restoring = false;
-    document.title = 'Poki';
-    console.info('[proxy] prevented false Poki 404 caused by proxy pathname');
-  }
-
-  function start() {
-    var root = document.getElementById('app-root');
-    if (!root) {
-      window.setTimeout(start, 10);
-      return;
-    }
-    capture(root);
-    var observer = new MutationObserver(function () {
-      repair();
-      if (settled) observer.disconnect();
-    });
-    observer.observe(root, { childList: true, subtree: true });
-    // Poll briefly as a fallback for frameworks that replace the root quickly.
-    var attempts = 0;
-    var timer = window.setInterval(function () {
-      attempts += 1;
-      repair();
-      if (settled || attempts >= 400) window.clearInterval(timer);
-    }, 10);
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start, { once: true });
-  } else {
-    start();
-  }
-})();`;
-
 const MCPEDL_CLIENT_RECOVERY = String.raw`;(function () {
   'use strict';
 
