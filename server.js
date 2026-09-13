@@ -13,6 +13,8 @@ const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PROXY_PREFIX = '/proxy/';
 const CONTEXT_COOKIE = '__proxy_origin';
+const POKI_WEB_ORIGIN = 'https://poki.com';
+const POKI_AUTH_HOSTS = new Set(['poki-auth.poki.com']);
 const YOUTUBE_TV_USER_AGENT = 'Mozilla/5.0 (Linux; Android 14; UHD Google TV STB Build/UTT1.250214.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/151.0.7922.199 Mobile Safari/537.36';
 const MAX_SOCKETS = positiveInteger(process.env.MAX_SOCKETS, 16);
 const MAX_FREE_SOCKETS = positiveInteger(process.env.MAX_FREE_SOCKETS, 16);
@@ -40,13 +42,28 @@ app.set('trust proxy', 1);
 app.use((req, res, next) => {
   const originalSetHeader = res.setHeader;
   res.setHeader = function setSafeHeader(name, value) {
-    if (String(name).toLowerCase() === 'location') {
+    const lowerName = String(name).toLowerCase();
+    if (lowerName === 'location') {
       value = sanitizeLocationValue(value);
+    }
+    if (lowerName === 'permissions-policy') {
+      value = sanitizePermissionsPolicyValue(value);
+      if (value == null || value === '') return this;
     }
     return originalSetHeader.call(this, name, value);
   };
   next();
 });
+
+function sanitizePermissionsPolicyValue(value) {
+  const values = Array.isArray(value) ? value : [value];
+  const cleaned = values
+    .flatMap((item) => String(item || '').split(','))
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item) => !/^attribution-reporting\s*=/i.test(item));
+  return cleaned.length ? cleaned.join(', ') : null;
+}
 
 function sanitizeLocationValue(value) {
   if (Array.isArray(value)) return value.map(sanitizeLocationValue);
@@ -291,6 +308,91 @@ function cleanProxyRequest(data) {
   if (!data?.headers) return;
   delete data.headers['proxy-connection'];
 }
+// Keep Poki authentication requests consistent with the upstream web origin.
+// This does not bypass authentication. A 401 from /sessions/whoami remains the
+// correct response when the browser has no valid Poki session cookie.
+function applyPokiRequestContext(data) {
+  if (!data?.headers || !data.url) return;
+  let target;
+  try {
+    target = new URL(data.url);
+  } catch {
+    return;
+  }
+  if (!POKI_AUTH_HOSTS.has(target.hostname.toLowerCase())) return;
+
+  data.headers.origin = POKI_WEB_ORIGIN;
+  data.headers.referer = `${POKI_WEB_ORIGIN}/`;
+  data.headers.host = target.host;
+
+  // These browser-facing values describe the proxy origin and can cause an
+  // upstream origin check to fail. Let Node generate the actual connection
+  // headers while retaining Cookie and Authorization when present.
+  delete data.headers['proxy-connection'];
+  delete data.headers['sec-fetch-site'];
+  delete data.headers['sec-fetch-mode'];
+  delete data.headers['sec-fetch-dest'];
+}
+
+// Poki auth responses must never be cached. cookieRewrite:true below remains
+// responsible for mapping upstream Set-Cookie headers onto the proxy origin.
+function normalizePokiAuthResponse(data) {
+  if (!data?.headers || !data.url) return;
+  let target;
+  try {
+    target = new URL(data.url);
+  } catch {
+    return;
+  }
+  if (!POKI_AUTH_HOSTS.has(target.hostname.toLowerCase())) return;
+
+  data.headers['cache-control'] = 'private, no-store, max-age=0';
+  data.headers.pragma = 'no-cache';
+  delete data.headers.expires;
+
+  // Keep redirects from the authentication service inside the proxy.
+  if (data.headers.location != null) {
+    const rewrite = (value) => {
+      if (typeof value !== 'string') return value;
+      try {
+        const redirected = new URL(value, target);
+        return `${PROXY_PREFIX}${redirected.href}`;
+      } catch {
+        return value;
+      }
+    };
+    data.headers.location = Array.isArray(data.headers.location)
+      ? data.headers.location.map(rewrite)
+      : rewrite(data.headers.location);
+  }
+
+  const status = Number(data.remoteResponse?.statusCode || 0);
+  if (status === 401 && target.pathname === '/sessions/whoami') {
+    console.info(JSON.stringify({
+      type: 'poki-auth-session-missing',
+      status,
+      path: target.pathname,
+      note: 'Expected when no valid Poki session cookie is available'
+    }));
+  }
+}
+
+// Chromium versions that do not recognise attribution-reporting emit a noisy
+// console warning. Remove only that unsupported Permissions-Policy directive.
+function sanitizePermissionsPolicy(data) {
+  if (!data?.headers || data.headers['permissions-policy'] == null) return;
+  const values = Array.isArray(data.headers['permissions-policy'])
+    ? data.headers['permissions-policy']
+    : [data.headers['permissions-policy']];
+  const cleaned = values
+    .flatMap((value) => String(value).split(','))
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .filter((value) => !/^attribution-reporting\s*=/i.test(value));
+  if (cleaned.length) data.headers['permissions-policy'] = cleaned.join(', ');
+  else delete data.headers['permissions-policy'];
+}
+
 function applyYouTubeTvUserAgent(data) {
   if (!data?.headers || !data.url) return;
   let target;
@@ -419,14 +521,10 @@ app.use((req, res, next) => {
   const upstreamOrigin = req.get('referer')
     ? proxyRefererOrigin
     : contextCookieOrigin;
-  const destination = String(req.get('sec-fetch-dest') || '').toLowerCase();
-  const mode = String(req.get('sec-fetch-mode') || '').toLowerCase();
-  const isNavigation =
-    req.method === 'HEAD' ||
-    mode === 'navigate' ||
-    destination === 'document' ||
-    destination === 'iframe';
-  if (!isNavigation || !upstreamOrigin) return next();
+  // Relative URLs emitted by the upstream page arrive at this Express app as
+  // /textures/..., /cdn-cgi/..., etc. Proxy both navigations and subresources;
+  // limiting this to navigations was the reason thumbnails returned local 404s.
+  if (!upstreamOrigin) return next();
   let target;
   try {
     target = new URL(req.originalUrl, `${upstreamOrigin}/`);
@@ -437,6 +535,208 @@ app.use((req, res, next) => {
   req.url = `${PROXY_PREFIX}${target.href}`;
   next();
 });
+
+// Relay selected Bloxd backend APIs directly. On Cloud Shell, allowing
+// Unblocker to answer an OPTIONS request with a redirect makes the browser reject
+// the preflight. A direct relay keeps the request on this origin and returns CORS
+// headers without attempting to bypass any upstream authentication or challenge.
+app.use(PROXY_PREFIX, relayBloxdBackendApi);
+function relayBloxdBackendApi(req, res, next) {
+  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(req.method)) return next();
+  let rawTarget = req.originalUrl.slice(PROXY_PREFIX.length);
+  rawTarget = rawTarget.replace(/^(https?):\/(?!\/)/i, '$1://');
+
+  let target;
+  try { target = new URL(rawTarget); } catch { return next(); }
+
+  const hostname = target.hostname.toLowerCase();
+  const allowedHosts = new Set([
+    'firebaseinstallations.googleapis.com',
+    'identitytoolkit.googleapis.com',
+    'securetoken.googleapis.com',
+    'firebaseremoteconfig.googleapis.com'
+  ]);
+  if (target.protocol !== 'https:' || !allowedHosts.has(hostname)) return next();
+
+  if (req.method === 'OPTIONS') {
+    setRelayCors(req, res);
+    return res.status(204).end();
+  }
+
+  const headers = Object.create(null);
+  const blockedRequestHeaders = new Set([
+    'host', 'connection', 'proxy-connection', 'keep-alive',
+    'transfer-encoding', 'upgrade', 'origin', 'referer'
+  ]);
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (!blockedRequestHeaders.has(name.toLowerCase()) && value != null) headers[name] = value;
+  }
+  headers.host = target.host;
+  headers.origin = 'https://bloxd.io';
+  headers.referer = 'https://bloxd.io/';
+
+  const upstream = https.request(target, {
+    method: req.method,
+    headers,
+    agent: httpsAgent,
+    timeout: 30_000
+  }, (remote) => {
+    const responseHeaders = { ...remote.headers };
+    stripHopByHopHeaders(responseHeaders);
+    applyRelayCors(req, responseHeaders);
+    if (responseHeaders.location) {
+      try {
+        const redirected = new URL(responseHeaders.location, target);
+        if (redirected.protocol === 'https:' && allowedHosts.has(redirected.hostname.toLowerCase())) {
+          responseHeaders.location = `${PROXY_PREFIX}${redirected.href}`;
+        }
+      } catch {}
+    }
+    res.writeHead(Number(remote.statusCode || 502), responseHeaders);
+    if (req.method === 'HEAD') {
+      remote.resume();
+      res.end();
+    } else {
+      remote.pipe(res);
+    }
+  });
+
+  upstream.once('timeout', () => upstream.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
+  upstream.once('error', (error) => {
+    console.error(JSON.stringify({
+      type: 'bloxd-backend-api-error',
+      host: hostname,
+      code: error.code || 'ERROR',
+      path: target.pathname
+    }));
+    if (!res.headersSent) res.status(502).send('Bad Gateway');
+    else res.destroy(error);
+  });
+  req.once('aborted', () => upstream.destroy());
+  req.pipe(upstream);
+}
+
+function setRelayCors(req, res) {
+  const origin = req.get('origin');
+  if (origin) res.set('Access-Control-Allow-Origin', origin);
+  res.set('Access-Control-Allow-Credentials', 'true');
+  res.set('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.set('Access-Control-Allow-Headers', req.get('access-control-request-headers') || 'content-type,authorization');
+  res.set('Access-Control-Max-Age', '600');
+  res.set('Vary', 'Origin, Access-Control-Request-Headers');
+}
+
+function applyRelayCors(req, headers) {
+  const origin = req.get('origin');
+  if (!origin) return;
+  headers['access-control-allow-origin'] = origin;
+  headers['access-control-allow-credentials'] = 'true';
+  headers.vary = appendVary(headers.vary, 'Origin');
+}
+
+function stripHopByHopHeaders(headers) {
+  for (const name of [
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailer', 'transfer-encoding', 'upgrade'
+  ]) delete headers[name];
+}
+
+// Relay Poki authentication directly. Keeping this endpoint out of the generic
+// HTML proxy avoids losing Set-Cookie headers and preserves the upstream request
+// method/body. Authentication is not bypassed: an anonymous whoami still returns 401.
+app.use(PROXY_PREFIX, relayPokiAuthApi);
+function relayPokiAuthApi(req, res, next) {
+  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(req.method)) return next();
+  let rawTarget = req.originalUrl.slice(PROXY_PREFIX.length);
+  rawTarget = rawTarget.replace(/^(https?):\/(?!\/)/i, '$1://');
+  let target;
+  try { target = new URL(rawTarget); } catch { return next(); }
+  if (target.protocol !== 'https:' || !POKI_AUTH_HOSTS.has(target.hostname.toLowerCase())) return next();
+
+  if (req.method === 'OPTIONS') {
+    setRelayCors(req, res);
+    return res.status(204).end();
+  }
+
+  const headers = Object.create(null);
+  for (const name of [
+    'accept', 'accept-encoding', 'accept-language', 'authorization',
+    'content-type', 'content-length', 'user-agent', 'x-csrf-token', 'x-xsrf-token'
+  ]) {
+    if (req.headers[name] != null) headers[name] = req.headers[name];
+  }
+  const upstreamCookie = decodePokiAuthCookies(req.headers.cookie);
+  if (upstreamCookie) headers.cookie = upstreamCookie;
+  headers.host = target.host;
+  headers.origin = POKI_WEB_ORIGIN;
+  headers.referer = `${POKI_WEB_ORIGIN}/`;
+
+  const upstream = https.request(target, {
+    method: req.method,
+    headers,
+    agent: httpsAgent,
+    timeout: 30_000
+  }, (remote) => {
+    const responseHeaders = { ...remote.headers };
+    stripHopByHopHeaders(responseHeaders);
+    responseHeaders['cache-control'] = 'private, no-store, max-age=0';
+    responseHeaders.pragma = 'no-cache';
+    delete responseHeaders.expires;
+    applyRelayCors(req, responseHeaders);
+
+    const setCookies = remote.headers['set-cookie'];
+    if (setCookies) {
+      responseHeaders['set-cookie'] = (Array.isArray(setCookies) ? setCookies : [setCookies])
+        .map(encodePokiAuthSetCookie);
+    }
+    if (responseHeaders.location) {
+      try {
+        responseHeaders.location = `${PROXY_PREFIX}${new URL(responseHeaders.location, target).href}`;
+      } catch {}
+    }
+    res.writeHead(Number(remote.statusCode || 502), responseHeaders);
+    if (req.method === 'HEAD') { remote.resume(); res.end(); }
+    else remote.pipe(res);
+  });
+  upstream.once('timeout', () => upstream.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
+  upstream.once('error', (error) => {
+    console.error(JSON.stringify({ type: 'poki-auth-api-error', code: error.code || 'ERROR', path: target.pathname }));
+    if (!res.headersSent) res.status(502).send('Bad Gateway');
+    else res.destroy(error);
+  });
+  req.once('aborted', () => upstream.destroy());
+  req.pipe(upstream);
+}
+
+const POKI_AUTH_COOKIE_PREFIX = '__poki_auth__';
+function encodePokiAuthSetCookie(cookie) {
+  const parts = String(cookie).split(';');
+  const first = parts.shift();
+  const separator = first.indexOf('=');
+  if (separator < 1) return cookie;
+  const name = first.slice(0, separator).trim();
+  const value = first.slice(separator + 1);
+  const attributes = parts
+    .map((part) => part.trim())
+    .filter((part) => !/^domain=/i.test(part) && !/^path=/i.test(part) && !/^samesite=/i.test(part));
+  attributes.push('Path=/');
+  attributes.push('SameSite=Lax');
+  if (!attributes.some((part) => /^secure$/i.test(part))) attributes.push('Secure');
+  return `${POKI_AUTH_COOKIE_PREFIX}${encodeURIComponent(name)}=${value}; ${attributes.join('; ')}`;
+}
+
+function decodePokiAuthCookies(header) {
+  const cookies = parseCookies(header);
+  const result = [];
+  for (const [name, value] of Object.entries(cookies)) {
+    if (!name.startsWith(POKI_AUTH_COOKIE_PREFIX)) continue;
+    let upstreamName;
+    try { upstreamName = decodeURIComponent(name.slice(POKI_AUTH_COOKIE_PREFIX.length)); }
+    catch { continue; }
+    if (upstreamName) result.push(`${upstreamName}=${value}`);
+  }
+  return result.join('; ');
+}
 
 // Relay YouTube TV account APIs directly. Unblocker normalizes a target like
 // https://www.youtube.com/... into a 307 Location containing https:/..., which
@@ -586,9 +886,11 @@ const unblocker = new Unblocker({
   clientScripts: true,
   httpAgent,
   httpsAgent,
-  requestMiddleware: [cleanProxyRequest, applyYouTubeTvUserAgent],
+  requestMiddleware: [cleanProxyRequest, applyPokiRequestContext, applyYouTubeTvUserAgent],
   responseMiddleware: [
     repairMalformedProxyLocation,
+    normalizePokiAuthResponse,
+    sanitizePermissionsPolicy,
     repairMinecraftDownloadRedirect,
     keepYouTubeTvRedirectInsideProxy,
     sanitizeProxyResponseHeaders,
@@ -652,7 +954,7 @@ function sendPatchedUnblockerClient(req, res, next) {
   res.set('Cache-Control', 'no-store, max-age=0');
   res.set('Pragma', 'no-cache');
   res.set('X-Content-Type-Options', 'nosniff');
-  res.send(`${unblockerClientSource}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}`);
+  res.send(`${unblockerClientSource}\n${BLOXD_RELATIVE_RESOURCE_PATCH}\n${GLOBAL_PROXIED_NAVIGATION_PATCH}\n${MINECRAFT_DOWNLOAD_NAVIGATION_PATCH}\n${YOUTUBE_TV_WATERMARK_PATCH}\n${MCPEDL_CLIENT_RECOVERY}\n${POKI_SPA_ROUTE_PATCH}`);
 }
 
 // Different unblocker releases emit either path. Register both before
@@ -664,6 +966,49 @@ app.get(`${PROXY_PREFIX}unblocker-client.js`, sendPatchedUnblockerClient);
 // cover many DOM assignments, but sites such as DuckDuckGo can install a
 // direct absolute result URL after rendering. Capture navigation gestures and
 // normalize those links before the browser leaves this origin.
+const BLOXD_RELATIVE_RESOURCE_PATCH = String.raw`;(function () {
+  'use strict';
+  var PREFIX = '/proxy/';
+  function upstream() {
+    var path = String(window.location.pathname || '');
+    if (path.indexOf(PREFIX) !== 0) return null;
+    var raw = path.slice(PREFIX.length) + String(window.location.search || '');
+    raw = raw.replace(/^(https?):\/(?!\/)/i, '$1://');
+    try { return new URL(raw); } catch (error) { return null; }
+  }
+  function fix(value) {
+    if (typeof value !== 'string' || value.charAt(0) !== '/' || value.indexOf('//') === 0 || value.indexOf(PREFIX) === 0) return value;
+    var base = upstream();
+    if (!base) return value;
+    try { return PREFIX + new URL(value, base.origin).href; } catch (error) { return value; }
+  }
+  function rewrite(root) {
+    if (!root || root.nodeType !== 1) return;
+    var nodes = [root];
+    if (root.querySelectorAll) nodes = nodes.concat(Array.prototype.slice.call(root.querySelectorAll('[src],[href],[poster]')));
+    for (var i = 0; i < nodes.length; i += 1) {
+      for (var j = 0; j < 3; j += 1) {
+        var attr = ['src', 'href', 'poster'][j];
+        if (!nodes[i].hasAttribute || !nodes[i].hasAttribute(attr)) continue;
+        var before = nodes[i].getAttribute(attr);
+        var after = fix(before);
+        if (after !== before) nodes[i].setAttribute(attr, after);
+      }
+    }
+  }
+  function start() {
+    rewrite(document.documentElement);
+    new MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i += 1) {
+        if (records[i].type === 'attributes') rewrite(records[i].target);
+        for (var j = 0; j < records[i].addedNodes.length; j += 1) rewrite(records[i].addedNodes[j]);
+      }
+    }).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'href', 'poster'] });
+  }
+  if (document.documentElement) start();
+  else document.addEventListener('DOMContentLoaded', start, { once: true });
+})();`;
+
 const GLOBAL_PROXIED_NAVIGATION_PATCH = String.raw`;(function () {
   'use strict';
   var PREFIX = '/proxy/';
@@ -867,6 +1212,90 @@ const YOUTUBE_TV_WATERMARK_PATCH = String.raw`;(function () {
 // response contains frontpageV2=null, hydration can leave all shelves empty.
 // Retry the site's own Vuex action after Nuxt is ready. The existing XHR/fetch
 // wrappers proxy the api.mcpedl.com request through this server.
+// Poki's client router reads the proxy-visible pathname after hydration.
+// It initially renders the upstream /jp page from server state, then interprets
+// /proxy/https://poki.com/jp as a Poki route and replaces the page with its 404.
+// Preserve the successfully rendered home view and restore it if that specific
+// false 404 is mounted. Links remain normal anchors and are handled by the
+// existing proxy navigation patch.
+const POKI_SPA_ROUTE_PATCH = String.raw`;(function () {
+  'use strict';
+  var PREFIX = '/proxy/';
+  var path = String(window.location.pathname || '');
+  var lower = path.toLowerCase();
+  if (lower.indexOf(PREFIX + 'https://poki.com/') !== 0 &&
+      lower.indexOf(PREFIX + 'https://www.poki.com/') !== 0) return;
+
+  // The language redirect adds a tracking fragment. It is not part of the
+  // upstream route and can trigger an unnecessary POP navigation.
+  if (/^#utm_/i.test(String(window.location.hash || ''))) {
+    try {
+      history.replaceState(history.state, document.title,
+        window.location.pathname + window.location.search);
+    } catch (error) {}
+  }
+
+  var savedMarkup = '';
+  var restoring = false;
+  var settled = false;
+
+  function isRealHome(root) {
+    return !!root && !root.querySelector('#pageError') &&
+      !!(root.querySelector('[id^="pageHome"]') ||
+         root.querySelector('.summaryTile') ||
+         root.querySelector('a[href*="/g/"]'));
+  }
+
+  function capture(root) {
+    if (!savedMarkup && isRealHome(root)) {
+      savedMarkup = root.innerHTML;
+      console.info('[proxy] captured Poki page before client-route hydration');
+    }
+  }
+
+  function repair() {
+    if (restoring || settled) return;
+    var root = document.getElementById('app-root');
+    if (!root) return;
+    capture(root);
+    if (!root.querySelector('#pageError') || !savedMarkup) return;
+
+    restoring = true;
+    root.innerHTML = savedMarkup;
+    settled = true;
+    restoring = false;
+    document.title = 'Poki';
+    console.info('[proxy] prevented false Poki 404 caused by proxy pathname');
+  }
+
+  function start() {
+    var root = document.getElementById('app-root');
+    if (!root) {
+      window.setTimeout(start, 10);
+      return;
+    }
+    capture(root);
+    var observer = new MutationObserver(function () {
+      repair();
+      if (settled) observer.disconnect();
+    });
+    observer.observe(root, { childList: true, subtree: true });
+    // Poll briefly as a fallback for frameworks that replace the root quickly.
+    var attempts = 0;
+    var timer = window.setInterval(function () {
+      attempts += 1;
+      repair();
+      if (settled || attempts >= 400) window.clearInterval(timer);
+    }, 10);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
+})();`;
+
 const MCPEDL_CLIENT_RECOVERY = String.raw`;(function () {
   'use strict';
 
